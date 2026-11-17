@@ -9,6 +9,9 @@ processed_files.json
 # Данные (аудио и результаты обработки)
 data/
 
+# Песочница
+sandbox/
+
 # Системные файлы
 .DS_Store
 Thumbs.db
