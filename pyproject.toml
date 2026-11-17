@@ -1,0 +1,18 @@
+[tool.poetry]
+name = "callcenteranalytics"
+version = "0.1.0"
+description = ""
+authors = ["Oleg Borisov <164464154+HRMetriX@users.noreply.github.com>"]
+package-mode = false
+
+[tool.poetry.dependencies]
+python = ">=3.12,<3.13"
+numpy = "^2.5.5"
+silero-vad = "^6.2.3"
+soundfile = "^0.14.0"
+gigaam = {git = "https://github.com/salute-developers/GigaAM.git", rev = "main"}
+torchaudio = "^2.11.1"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
