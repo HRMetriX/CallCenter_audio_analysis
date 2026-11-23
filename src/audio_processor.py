@@ -1,105 +1,108 @@
+import json
 import subprocess
+
 import numpy as np
-import torch
-from silero_vad import load_silero_vad, get_speech_timestamps
-import soundfile as sf
-from io import BytesIO
-from config.settings import TARGET_SAMPLE_RATE, VAD_THRESHOLD, MIN_SPEECH_DURATION_MS, MIN_SILENCE_DURATION_MS, \
-    SPEECH_PAD_MS
+import soxr
+
+from config.settings import TARGET_SAMPLE_RATE
 from src.utils import setup_logger
 
 logger = setup_logger("AudioProcessor")
 
 
 class AudioProcessor:
-    def __init__(self):
-        self.vad_model = None
-        self._load_vad()
+    """
+    Предобработка аудио.
 
-    def _load_vad(self):
-        """Загружает модель Silero VAD."""
-        logger.info("Загрузка модели Silero VAD...")
-        self.vad_model = load_silero_vad()
-        logger.info("Модель Silero VAD загружена.")
+    ИНВАРИАНТ: весь пайплайн работает на TARGET_SAMPLE_RATE (16 кГц).
+    Исходная частота из ffprobe используется только для декодирования и логов.
+    """
 
-    def decode_and_split(self, file_path: str) -> dict[int, np.ndarray]:
-        """
-        Декодирует аудиофайл, ресамплит до 16кГц и разделяет на каналы.
-        Возвращает словарь {channel_index: numpy_array}.
-        """
-        logger.info(f"Декодирование и разделение каналов: {file_path}")
+    def analyze_and_fix(self, file_path: str) -> dict:
+        """Декодирует файл один раз и приводит все каналы к TARGET_SAMPLE_RATE."""
+        logger.info(f"Анализ и подготовка файла: {file_path}")
 
-        # Получаем информацию о количестве каналов через ffprobe
-        probe_cmd = [
-            "ffprobe", "-v", "error",
-            "-show_entries", "stream=channels",
-            "-of", "default=noprint_wrappers=1:nokey=1",
-            "-select_streams", "a:0",
-            file_path
-        ]
-        try:
-            result = subprocess.run(probe_cmd, capture_output=True, text=True, check=True)
-            channels = int(result.stdout.strip())
-        except Exception as e:
-            logger.error(f"Ошибка при определении количества каналов: {e}")
-            raise
+        meta = self._get_meta(file_path)
+        n_ch = meta["audio"]["channels"]
+        src_sr = meta["audio"]["sample_rate_hz"]
+
+        raw_channels = self._decode_raw(file_path, n_ch, src_sr)
 
         channels_data = {}
-        for ch in range(channels):
-            # Используем фильтр pan для выбора конкретного канала (c0=c0 - левый, c0=c1 - правый)
-            cmd = [
-                "ffmpeg", "-v", "error",
-                "-i", file_path,
-                "-af", f"pan=mono|c0=c{ch}",
-                "-f", "f32le",
-                "-ac", "1",
-                "-ar", str(TARGET_SAMPLE_RATE),
-                "-"
-            ]
-            try:
-                process = subprocess.run(cmd, capture_output=True, check=True)
-                raw_audio = process.stdout
-                audio_np = np.frombuffer(raw_audio, dtype=np.float32)
-                channels_data[ch] = audio_np
-                logger.debug(f"Канал {ch} декодирован: {len(audio_np)} сэмплов.")
-            except Exception as e:
-                logger.error(f"Ошибка декодирования канала {ch}: {e}")
-                # Выведем stderr для отладки, если ошибка осталась
-                if hasattr(e, 'stderr'):
-                    logger.error(f"ffmpeg stderr: {e.stderr.decode('utf-8', errors='replace')}")
-                raise
+        for i, ch in enumerate(raw_channels):
+            if src_sr != TARGET_SAMPLE_RATE:
+                ch = soxr.resample(ch, src_sr, TARGET_SAMPLE_RATE, quality="VHQ")
+            channels_data[i] = np.ascontiguousarray(ch, dtype=np.float32)
 
-        return channels_data
-
-    def get_speech_segments(self, audio: np.ndarray) -> list[dict]:
-        """
-        Определяет сегменты речи с помощью Silero VAD.
-        Возвращает список словарей {'start': float, 'end': float}.
-        """
-        tensor = torch.from_numpy(audio.astype(np.float32))
-        timestamps = get_speech_timestamps(
-            tensor,
-            self.vad_model,
-            return_seconds=True,
-            threshold=VAD_THRESHOLD,
-            min_speech_duration_ms=MIN_SPEECH_DURATION_MS,
-            min_silence_duration_ms=MIN_SILENCE_DURATION_MS,
-            speech_pad_ms=SPEECH_PAD_MS,
+        logger.info(
+            f"Каналов: {n_ch}, исходный SR: {src_sr} Гц -> {TARGET_SAMPLE_RATE} Гц, "
+            f"длительность: {len(channels_data[0]) / TARGET_SAMPLE_RATE:.1f} с"
         )
-        logger.debug(f"Найдено {len(timestamps)} речевых сегментов.")
-        return timestamps
 
-    def extract_segment_audio(self, full_audio: np.ndarray, start_sec: float, end_sec: float) -> np.ndarray:
+        return {
+            "fixes": [],
+            "channels_data": channels_data,
+            "sr": TARGET_SAMPLE_RATE,
+            "meta": {"audio": {**meta["audio"], "src_sample_rate_hz": src_sr}},
+        }
+
+    def _get_meta(self, file_path: str) -> dict:
+        """Метаданные через ffprobe."""
+        cmd = [
+            "ffprobe", "-v", "error",
+            "-print_format", "json",
+            "-show_format", "-show_streams",
+            file_path,
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        data = json.loads(result.stdout)
+        audio_streams = [s for s in data.get("streams", []) if s.get("codec_type") == "audio"]
+        if not audio_streams:
+            raise RuntimeError("No audio stream found")
+        a = audio_streams[0]
+        return {
+            "audio": {
+                "channels": int(a.get("channels", 0)),
+                "sample_rate_hz": int(a.get("sample_rate", 0)),
+            }
+        }
+
+    def _decode_raw(self, file_path: str, channels: int, sr: int) -> list:
+        """Декодирует все каналы в нативном SR без ресемплинга ffmpeg."""
+        cmd = [
+            "ffmpeg", "-v", "error",
+            "-i", file_path,
+            "-f", "f32le",
+            "-ac", str(channels),
+            "-ar", str(sr),
+            "-",
+        ]
+        proc = subprocess.run(cmd, capture_output=True, check=True, timeout=300)
+        audio = np.frombuffer(proc.stdout, dtype=np.float32).copy()
+        if channels > 1:
+            audio = audio.reshape(-1, channels)
+            return [audio[:, i] for i in range(channels)]
+        return [audio]
+
+    @staticmethod
+    def extract_segment_audio(full_audio: np.ndarray, start_sec: float, end_sec: float,
+                              sr: int = TARGET_SAMPLE_RATE) -> np.ndarray:
+        """Вырезает фрагмент по времени (с защитой от выхода за границы)."""
+        start = max(0, int(start_sec * sr))
+        end = min(len(full_audio), int(end_sec * sr))
+        if start >= end:
+            return np.array([], dtype=np.float32)
+        return full_audio[start:end]
+
+    @staticmethod
+    def normalize_segment(x: np.ndarray, target_dbfs: float = -23.0,
+                          max_gain_db: float = 30.0) -> np.ndarray:
         """
-        Извлекает фрагмент аудио из полного массива по времени.
-        Не создает файлов на диске.
+        Локальная нормализация сегмента с ограничением усиления.
+        Вытягивает тихого оператора, не раздувая шум до бесконечности.
         """
-        sr = TARGET_SAMPLE_RATE
-        start_sample = int(start_sec * sr)
-        end_sample = int(end_sec * sr)
-
-        # Защита от выхода за границы массива
-        if start_sample < 0: start_sample = 0
-        if end_sample > len(full_audio): end_sample = len(full_audio)
-
-        return full_audio[start_sample:end_sample]
+        if len(x) == 0:
+            return x
+        rms = np.sqrt(np.mean(x ** 2) + 1e-12)
+        gain = min(10 ** (target_dbfs / 20) / rms, 10 ** (max_gain_db / 20))
+        return np.clip(x * gain, -1.0, 1.0).astype(np.float32)
