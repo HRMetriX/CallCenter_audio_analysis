@@ -10,11 +10,11 @@ PROCESSED_REGISTRY = PROJECT_ROOT / "processed_files.json"
 # Параметры аудио
 TARGET_SAMPLE_RATE = 16000
 
-# Параметры VAD (Silero)
-VAD_THRESHOLD = 0.5
-MIN_SPEECH_DURATION_MS = 250
-MIN_SILENCE_DURATION_MS = 300
-SPEECH_PAD_MS = 200
+# Параметры VAD (Silero) - Экстремально чувствительные настройки
+VAD_THRESHOLD = 0.15          # Снижаем еще чуть-чуть
+MIN_SPEECH_DURATION_MS = 50   # Ловим даже самые короткие вдохи/слова
+MIN_SILENCE_DURATION_MS = 300 # Уменьшаем паузу, чтобы быстрее реагировать на смену спикера
+SPEECH_PAD_MS = 50            # Минимальный паддинг
 
 # Параметры ASR (GigaAM)
 ASR_MODEL_NAME = "v3_e2e_rnnt"
