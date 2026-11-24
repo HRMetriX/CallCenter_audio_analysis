@@ -1,5 +1,3 @@
-import json
-import random
 import time
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -7,16 +5,17 @@ from typing import Dict, List, Optional, Tuple
 from config.settings import (
     DATA_OUT,
     LONGFORM_THRESHOLD_SEC,
-    PROCESSED_REGISTRY,
+    PIPELINE_VERSION,
     TARGET_SAMPLE_RATE,
 )
 from src.asr_engine import ASREngine
 from src.audio_processor import AudioProcessor
 from src.diarizer import SpeakerDiarizer
 from src.utils import (
-    load_processed_registry,
+    FailureLog,
+    ProcessedRegistry,
+    atomic_write_json,
     log_execution_time,
-    save_processed_registry,
     setup_logger,
 )
 
@@ -72,26 +71,31 @@ def merge_turns(utterances: List[Dict]) -> List[Dict]:
 
 
 class CallCenterPipeline:
-    def __init__(self, random_count: Optional[int] = None):
+    def __init__(self, registry: ProcessedRegistry, failures: FailureLog):
+        """
+        Отбор файлов (что уже обработано, --force, --retry-errors, --random)
+        делает вызывающий код (main.py); пайплайн обрабатывает то, что ему передали.
+        """
+        self.registry = registry
+        self.failures = failures
         self.audio_proc = AudioProcessor()
         self.asr_eng = ASREngine()
         self.diarizer = SpeakerDiarizer()
-        self.processed_files = load_processed_registry(PROCESSED_REGISTRY)
-        self.random_count = random_count
 
-    def _save_dialogue_json(self, dialogue: List[Dict], out_path: Path):
-        data = {
+    # --- сохранение результатов (все записи атомарные) -------------------
+    @staticmethod
+    def _save_dialogue_json(dialogue: List[Dict], out_path: Path):
+        atomic_write_json(out_path, {
             "source_file": out_path.stem.replace("_dialogue", ""),
             "dialogue": dialogue,
-        }
-        with open(out_path, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
+        })
 
-    def _save_readable_json(self, source_file: str, duration_sec: float,
+    @staticmethod
+    def _save_readable_json(source_file: str, duration_sec: float,
                             utterances: List[Dict], out_path: Path):
         """Сохраняет диалог в читаемом виде: "оператор: ...", "клиент: ..."."""
         turns = merge_turns(utterances)
-        data = {
+        atomic_write_json(out_path, {
             "source_file": source_file,
             "duration_sec": round(duration_sec, 3),
             "turns": turns,
@@ -99,14 +103,13 @@ class CallCenterPipeline:
                 f"{SPEAKER_LABELS.get(t['speaker'], t['speaker'])}: {t['text']}"
                 for t in turns
             ],
-        }
-        with open(out_path, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
+        })
 
-    def _save_transcript_json(self, full_data: Dict, out_path: Path):
-        with open(out_path, "w", encoding="utf-8") as f:
-            json.dump(full_data, f, ensure_ascii=False, indent=2)
+    @staticmethod
+    def _save_transcript_json(full_data: Dict, out_path: Path):
+        atomic_write_json(out_path, full_data)
 
+    # --- обработка канала -----------------------------------------------
     def _process_channel(self, ch_idx: int, audio, total_sec: float) -> List[Dict]:
         """Диаризация + посегментная ASR одного канала. Возвращает список реплик."""
         role = CHANNEL_ROLES.get(ch_idx, f"channel_{ch_idx}")
@@ -171,13 +174,15 @@ class CallCenterPipeline:
             })
         return utterances
 
+    # --- обработка файла ------------------------------------------------
     @log_execution_time(logger)
-    def process_file(self, file_path: Path) -> bool:
-        """Обрабатывает один аудиофайл: декодирование -> диаризация -> ASR -> JSON."""
-        if file_path.name in self.processed_files:
-            logger.info(f"Файл {file_path.name} уже обработан. Пропуск.")
-            return False
-
+    def process_file(self, file_path: Path) -> Optional[Dict]:
+        """
+        Обрабатывает один файл: декодирование -> диаризация -> ASR -> JSON.
+        Возвращает метаданные результата при успехе и None при исключении
+        (исключение пишется в failed_files.json, файл будет повторён при следующем запуске).
+        """
+        stem = file_path.stem
         logger.info(f"Начало обработки: {file_path.name}")
         start_time = time.time()
 
@@ -189,6 +194,7 @@ class CallCenterPipeline:
             full_transcript = {
                 "source_file": file_path.name,
                 "processed_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "pipeline_version": PIPELINE_VERSION,
                 "processing_fixes": analysis["fixes"],
                 "src_sample_rate_hz": analysis["meta"]["audio"]["src_sample_rate_hz"],
                 "pipeline_sample_rate_hz": SR,
@@ -220,69 +226,81 @@ class CallCenterPipeline:
 
             all_utterances.sort(key=lambda u: u["start"])
 
-            stem = file_path.stem
             out_dir = DATA_OUT / stem
             out_dir.mkdir(parents=True, exist_ok=True)
+            tr_path = out_dir / f"{stem}_transcript.json"
 
-            self._save_transcript_json(full_transcript, out_dir / f"{stem}_transcript.json")
+            # Порядок записи важен: transcript.json - маркер "файл готов", поэтому
+            # старый удаляем до записи, а новый пишем последним. Если процесс оборвётся
+            # на середине, файл не будет считаться обработанным и повторится при перезапуске.
+            tr_path.unlink(missing_ok=True)
             self._save_dialogue_json(all_utterances, out_dir / f"{stem}_dialogue.json")
             self._save_readable_json(
                 file_path.name, total_sec, all_utterances, out_dir / f"{stem}_readable.json"
             )
+            self._save_transcript_json(full_transcript, tr_path)
 
-            self.processed_files.add(file_path.name)
-            save_processed_registry(PROCESSED_REGISTRY, self.processed_files)
+            channels = full_transcript["channels"].values()
+            total_errors = sum(c["asr_errors"] for c in channels)
+            meta = {
+                "source_file": file_path.name,
+                "processed_at": full_transcript["processed_at"],
+                "duration_sec": round(total_sec, 3),
+                "processing_sec": round(time.time() - start_time, 1),
+                "asr_errors": total_errors,
+                "longform_segments": sum(c["longform_segments"] for c in channels),
+                "pipeline_version": PIPELINE_VERSION,
+            }
+            self.registry.mark_done(stem, meta)
+            self.failures.clear(stem)
 
-            total_errors = sum(c["asr_errors"] for c in full_transcript["channels"].values())
             if total_errors:
-                logger.warning(f"⚠️ {file_path.name}: сегментов с ошибкой ASR: {total_errors}")
-            logger.info(f"✅ Успешно: {file_path.name} за {time.time() - start_time:.2f} сек.")
-            return True
+                logger.warning(f"⚠️ {file_path.name}: сегментов с ошибкой ASR: {total_errors} "
+                               f"(можно повторить: --retry-errors)")
+            logger.info(f"✅ Успешно: {file_path.name} за {meta['processing_sec']:.2f} сек.")
+            return meta
 
         except Exception as e:
             logger.error(f"❌ Ошибка при обработке {file_path.name}: {e}", exc_info=True)
-            return False
+            self.failures.record(stem, f"{type(e).__name__}: {e}")
+            return None
 
-    def run_batch(self, input_dir: Path):
-        """Пакетная обработка с поддержкой случайной выборки."""
-        files = sorted(input_dir.glob("*.ogg"))
-        if not files:
-            logger.warning(f"В папке {input_dir} не найдено .ogg файлов.")
-            return
-
-        if self.random_count and self.random_count > 0:
-            if self.random_count >= len(files):
-                logger.info(f"Запрос {self.random_count} файлов, всего доступно {len(files)}. Обработаем все.")
-            else:
-                files = random.sample(files, self.random_count)
-                logger.info(f"🎲 Выбрано {len(files)} случайных файлов из {input_dir}")
-
-        logger.info(f"Найдено {len(files)} файлов для обработки.")
-        success_count = 0
+    def run_batch(self, files: List[Path]) -> Dict:
+        """Обрабатывает переданный список файлов и печатает итоговую статистику."""
+        total = len(files)
+        ok = 0
+        failed: List[str] = []
+        with_errors = 0
         total_duration = 0.0
-        total_processing_time = 0.0
+        total_processing = 0.0
+        batch_start = time.time()
 
-        for i, f in enumerate(files):
+        for i, f in enumerate(files, 1):
             t_start = time.time()
-            if self.process_file(f):
-                success_count += 1
-                t_elapsed = time.time() - t_start
-                try:
-                    tr_path = DATA_OUT / f.stem / f"{f.stem}_transcript.json"
-                    if tr_path.exists():
-                        with open(tr_path, "r", encoding="utf-8") as jf:
-                            dur = json.load(jf).get("duration_sec", 0)
-                        total_duration += dur
-                        total_processing_time += t_elapsed
-                        speed = dur / t_elapsed if t_elapsed > 0 else 0
-                        logger.info(f"[{i + 1}/{len(files)}] {f.name} | {dur:.1f}с | {t_elapsed:.1f}с | {speed:.2f}x")
-                except Exception:
-                    pass
+            meta = self.process_file(f)
+            elapsed = time.time() - t_start
+            if meta is None:
+                failed.append(f.name)
+                continue
+            ok += 1
+            if meta["asr_errors"]:
+                with_errors += 1
+            dur = meta["duration_sec"]
+            total_duration += dur
+            total_processing += elapsed
+            speed = dur / elapsed if elapsed > 0 else 0
+            logger.info(f"[{i}/{total}] {f.name} | {dur:.1f}с | {elapsed:.1f}с | {speed:.2f}x")
 
-        avg_speed = total_duration / total_processing_time if total_processing_time > 0 else 0
+        avg_speed = total_duration / total_processing if total_processing > 0 else 0
         logger.info("=" * 60)
         logger.info("🏁 ПАКЕТНАЯ ОБРАБОТКА ЗАВЕРШЕНА")
-        logger.info(f"Успешно: {success_count}/{len(files)}")
-        logger.info(f"Суммарная длительность: {total_duration:.1f} сек")
+        logger.info(f"Успешно: {ok}/{total}")
+        logger.info(f"С ошибками ASR в сегментах: {with_errors} (повтор: --retry-errors)")
+        logger.info(f"Упало с исключением: {len(failed)} (см. failed_files.json)")
+        for name in failed[:20]:
+            logger.info(f"   - {name}")
+        logger.info(f"Общее время: {time.time() - batch_start:.1f} сек")
+        logger.info(f"Суммарная длительность аудио: {total_duration:.1f} сек")
         logger.info(f"Средняя скорость: {avg_speed:.2f}x realtime")
         logger.info("=" * 60)
+        return {"ok": ok, "failed": failed, "with_errors": with_errors}

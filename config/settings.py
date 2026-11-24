@@ -1,11 +1,21 @@
 from pathlib import Path
 
+# Версия пайплайна: пишется в transcript.json и реестр, чтобы потом можно было
+# понять, какой версией кода обработан каждый файл.
+PIPELINE_VERSION = "2.0.0"
+
 # Пути
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DATA_IN = PROJECT_ROOT / "data" / "in"
 DATA_OUT = PROJECT_ROOT / "data" / "out"
 LOGS_DIR = PROJECT_ROOT / "logs"
+
+# Реестр обработанных файлов (индекс; источник истины - папки результатов в DATA_OUT)
 PROCESSED_REGISTRY = PROJECT_ROOT / "processed_files.json"
+# Журнал файлов, обработка которых упала с исключением
+FAILED_REGISTRY = PROJECT_ROOT / "failed_files.json"
+# Lock-файл: защита от одновременного запуска двух экземпляров пайплайна
+LOCK_FILE = PROJECT_ROOT / ".pipeline.lock"
 
 # Параметры аудио: весь пайплайн работает на этой частоте
 TARGET_SAMPLE_RATE = 16000
