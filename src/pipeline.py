@@ -4,7 +4,12 @@ import time
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-from config.settings import DATA_OUT, PROCESSED_REGISTRY, TARGET_SAMPLE_RATE
+from config.settings import (
+    DATA_OUT,
+    LONGFORM_THRESHOLD_SEC,
+    PROCESSED_REGISTRY,
+    TARGET_SAMPLE_RATE,
+)
 from src.asr_engine import ASREngine
 from src.audio_processor import AudioProcessor
 from src.diarizer import SpeakerDiarizer
@@ -20,39 +25,34 @@ logger = setup_logger("Pipeline")
 SR = TARGET_SAMPLE_RATE
 PAD_SEC = 0.25          # паддинг вокруг сегмента при вырезке
 MERGE_GAP_SEC = 0.6     # склеивать сегменты одного канала с паузой меньше этого
-MAX_SEG_SEC = 28.0      # максимум для одного вызова ASR
+MAX_MERGE_SEC = 23.0    # склейка соседей не создаёт спан длиннее этого (чтобы остаться в обычном режиме ASR)
 MIN_ASR_SEC = 0.25      # речь короче этого в ASR не отправляется
 SHORT_SOUND = "[короткий звук]"
 CHANNEL_ROLES = {0: "operator", 1: "client"}
+SPEAKER_LABELS = {"operator": "оператор", "client": "клиент"}
 
 
 def merge_segments(segs: List[Tuple[float, float]], gap: float = MERGE_GAP_SEC,
-                   max_len: float = MAX_SEG_SEC) -> List[Tuple[float, float]]:
-    """Склеивает близкие сегменты и режет слишком длинные на куски <= max_len."""
+                   max_merge: float = MAX_MERGE_SEC) -> List[Tuple[float, float]]:
+    """
+    Склеивает близкие сегменты (пауза < gap), пока объединённый спан не превысит max_merge.
+    Сегменты, которые уже длиннее max_merge сами по себе, не режутся: они уйдут
+    в ASR целиком (и будут обработаны через transcribe_longform).
+    """
     merged: List[List[float]] = []
     for s, e in sorted(segs):
-        if merged and s - merged[-1][1] < gap and e - merged[-1][0] <= max_len:
+        if merged and s - merged[-1][1] < gap and e - merged[-1][0] <= max_merge:
             merged[-1][1] = max(merged[-1][1], e)
         else:
             merged.append([s, e])
-
-    out: List[Tuple[float, float]] = []
-    for s, e in merged:
-        while e - s > max_len:
-            out.append((s, s + max_len))
-            s += max_len
-        out.append((s, e))
-    return out
-
-
-SPEAKER_LABELS = {"operator": "оператор", "client": "клиент"}
+    return [(s, e) for s, e in merged]
 
 
 def merge_turns(utterances: List[Dict]) -> List[Dict]:
     """
     Склеивает подряд идущие реплики одного спикера в одну (формат "диалог").
-    Реплики-заглушки [короткий звук] в читаемый диалог не попадают и
-    не разрывают реплику собеседника.
+    Реплики-заглушки [короткий звук] и пустые реплики (в том числе с ошибкой ASR)
+    в читаемый диалог не попадают и не разрывают реплику собеседника.
     """
     turns: List[Dict] = []
     for u in sorted(utterances, key=lambda x: x["start"]):
@@ -114,7 +114,11 @@ class CallCenterPipeline:
 
         raw = self.diarizer.diarize_channel(audio, ch_idx)
         spans = merge_segments([(x["start"], x["end"]) for x in raw])
-        logger.info(f"Канал {ch_idx}: {len(raw)} сегментов Pyannote -> {len(spans)} после слияния.")
+        long_spans = sum(1 for s, e in spans if (e - s) + 2 * PAD_SEC > LONGFORM_THRESHOLD_SEC)
+        logger.info(
+            f"Канал {ch_idx}: {len(raw)} сегментов Pyannote -> {len(spans)} после слияния "
+            f"(длинных, пойдут в longform: {long_spans})."
+        )
 
         utterances: List[Dict] = []
         for s, e in spans:
@@ -145,8 +149,14 @@ class CallCenterPipeline:
                     }
                     for w in asr_res["words"]
                 ]
+                if asr_res["mode"] == "longform":
+                    flags.append("longform")
+                if asr_res["error"]:
+                    flags.append("asr_error")
 
-            if not text:
+            # Пустой результат без ошибки пропускаем, а упавший сегмент оставляем в
+            # dialogue.json с флагом asr_error, чтобы потери были видны.
+            if not text and "asr_error" not in flags:
                 continue
 
             utterances.append({
@@ -192,12 +202,17 @@ class CallCenterPipeline:
                 utts = self._process_channel(ch_idx, audio, total_sec)
                 role = CHANNEL_ROLES.get(ch_idx, f"channel_{ch_idx}")
 
-                speech_texts = [u["text"] for u in utts if "short_sound" not in u["flags"]]
+                speech_texts = [
+                    u["text"] for u in utts
+                    if "short_sound" not in u["flags"] and u["text"]
+                ]
                 channel_words = [w for u in utts for w in u["words"]]
                 full_transcript["channels"][role] = {
                     "speech_sec": round(sum(u["duration"] for u in utts), 3),
                     "segments_count": len(utts),
                     "short_sounds": sum("short_sound" in u["flags"] for u in utts),
+                    "longform_segments": sum("longform" in u["flags"] for u in utts),
+                    "asr_errors": sum("asr_error" in u["flags"] for u in utts),
                     "full_text": " ".join(speech_texts),
                     "words": channel_words,
                 }
@@ -218,6 +233,9 @@ class CallCenterPipeline:
             self.processed_files.add(file_path.name)
             save_processed_registry(PROCESSED_REGISTRY, self.processed_files)
 
+            total_errors = sum(c["asr_errors"] for c in full_transcript["channels"].values())
+            if total_errors:
+                logger.warning(f"⚠️ {file_path.name}: сегментов с ошибкой ASR: {total_errors}")
             logger.info(f"✅ Успешно: {file_path.name} за {time.time() - start_time:.2f} сек.")
             return True
 

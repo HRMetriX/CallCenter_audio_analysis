@@ -1,18 +1,50 @@
-import argparse
+import os
 import sys
-import time
-from pathlib import Path
-from src.pipeline import CallCenterPipeline
-from src.utils import setup_logger
-from config.settings import DATA_IN
 
 from dotenv import load_dotenv
-import os
 
-# Загружаем переменные из .env файла
+# 1. Переменные из .env нужны до импорта остальных модулей (HF_TOKEN, FFMPEG_DLL_DIR)
 load_dotenv()
 
+# 2. Windows: transcribe_longform использует torchcodec, которому нужны DLL FFmpeg
+#    (shared-сборка). Python 3.8+ не ищет их в PATH, поэтому папку bin нужно добавить явно
+#    и до импорта gigaam / pyannote.
+_DLL_HANDLE = None
+
+
+def _setup_ffmpeg_dlls():
+    global _DLL_HANDLE
+    dll_dir = os.getenv("FFMPEG_DLL_DIR")
+    if not dll_dir or not hasattr(os, "add_dll_directory"):
+        return
+    if os.path.isdir(dll_dir):
+        _DLL_HANDLE = os.add_dll_directory(dll_dir)
+    else:
+        print(f"ВНИМАНИЕ: FFMPEG_DLL_DIR не найден: {dll_dir}", file=sys.stderr)
+
+
+_setup_ffmpeg_dlls()
+
+# 3. Остальные импорты (после настройки DLL)
+import argparse  # noqa: E402
+import json  # noqa: E402
+import time  # noqa: E402
+from pathlib import Path  # noqa: E402
+
+from config.settings import DATA_OUT  # noqa: E402
+from src.pipeline import CallCenterPipeline  # noqa: E402
+from src.utils import setup_logger  # noqa: E402
+
 logger = setup_logger("Main")
+
+
+def _read_duration(stem: str) -> float:
+    """Длительность записи из сохранённого transcript.json (0, если файла нет)."""
+    tr_path = DATA_OUT / stem / f"{stem}_transcript.json"
+    if not tr_path.exists():
+        return 0.0
+    with open(tr_path, "r", encoding="utf-8") as f:
+        return json.load(f).get("duration_sec", 0)
 
 
 def main():
@@ -28,7 +60,6 @@ def main():
 
     args = parser.parse_args()
 
-    # Передаем random_count в конструктор пайплайна
     pipeline = CallCenterPipeline(random_count=args.random)
 
     if args.force:
@@ -47,16 +78,11 @@ def main():
 
         if success:
             try:
-                import json
-                from config.settings import DATA_OUT
-                stem = file_path.stem
-                tr_path = DATA_OUT / stem / f"{stem}_transcript.json"
-                if tr_path.exists():
-                    with open(tr_path, 'r') as f:
-                        data = json.load(f)
-                        dur = data.get('duration_sec', 0)
-                        logger.info(
-                            f"📊 ИТОГ: {file_path.name} | Длит: {dur:.1f}с | Время обр: {t_elapsed:.1f}с | Speed: {dur / t_elapsed:.2f}x")
+                dur = _read_duration(file_path.stem)
+                logger.info(
+                    f"📊 ИТОГ: {file_path.name} | Длит: {dur:.1f}с | "
+                    f"Время обр: {t_elapsed:.1f}с | Speed: {dur / t_elapsed:.2f}x"
+                )
             except Exception:
                 logger.info(f"✅ Обработка завершена за {t_elapsed:.1f} сек.")
 
@@ -71,7 +97,6 @@ def main():
             logger.warning(f"В папке {dir_path} не найдено .ogg файлов.")
             return
 
-        # Логика случайной выборки
         if args.random and args.random > 0:
             if args.random >= len(files):
                 logger.info(f"Запрос {args.random} файлов, но всего доступно {len(files)}. Обработаем все.")
@@ -83,29 +108,23 @@ def main():
         logger.info(f"Найдено {len(files)} файлов. Запуск пакетной обработки...")
         total_start = time.time()
         success_count = 0
-        total_duration = 0
-        total_processing_time = 0
+        total_duration = 0.0
+        total_processing_time = 0.0
 
         for i, f in enumerate(files):
             t_file_start = time.time()
             if pipeline.process_file(f):
                 success_count += 1
                 t_file_elapsed = time.time() - t_file_start
-
                 try:
-                    import json
-                    from config.settings import DATA_OUT
-                    stem = f.stem
-                    tr_path = DATA_OUT / stem / f"{stem}_transcript.json"
-                    if tr_path.exists():
-                        with open(tr_path, 'r') as jf:
-                            data = json.load(jf)
-                            dur = data.get('duration_sec', 0)
-                            total_duration += dur
-                            total_processing_time += t_file_elapsed
-                            speed = dur / t_file_elapsed if t_file_elapsed > 0 else 0
-                            logger.info(
-                                f"[{i + 1}/{len(files)}] {f.name} | Длит: {dur:.1f}с | Обр: {t_file_elapsed:.1f}с | {speed:.2f}x")
+                    dur = _read_duration(f.stem)
+                    total_duration += dur
+                    total_processing_time += t_file_elapsed
+                    speed = dur / t_file_elapsed if t_file_elapsed > 0 else 0
+                    logger.info(
+                        f"[{i + 1}/{len(files)}] {f.name} | Длит: {dur:.1f}с | "
+                        f"Обр: {t_file_elapsed:.1f}с | {speed:.2f}x"
+                    )
                 except Exception:
                     pass
 
@@ -113,7 +132,7 @@ def main():
         avg_speed = total_duration / total_processing_time if total_processing_time > 0 else 0
 
         logger.info("=" * 60)
-        logger.info(f"🏁 ПАКЕТНАЯ ОБРАБОТКА ЗАВЕРШЕНА")
+        logger.info("🏁 ПАКЕТНАЯ ОБРАБОТКА ЗАВЕРШЕНА")
         logger.info(f"Успешно: {success_count}/{len(files)}")
         logger.info(f"Общее время: {total_elapsed:.1f} сек ({total_elapsed / 60:.1f} мин)")
         logger.info(f"Суммарная длительность аудио: {total_duration:.1f} сек")

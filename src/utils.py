@@ -1,8 +1,11 @@
-import logging
-import time
 import json
+import logging
+import os
+import time
 from functools import wraps
 from logging.handlers import RotatingFileHandler
+from pathlib import Path
+
 from config.settings import LOG_FILE, LOG_MAX_BYTES, LOG_BACKUP_COUNT, LOGS_DIR
 
 
@@ -16,7 +19,6 @@ def setup_logger(name: str = "CallCenterAnalytics") -> logging.Logger:
 
     logger.setLevel(logging.INFO)
 
-    # Форматтер
     formatter = logging.Formatter(
         '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
     )
@@ -34,6 +36,9 @@ def setup_logger(name: str = "CallCenterAnalytics") -> logging.Logger:
     logger.addHandler(console_handler)
 
     return logger
+
+
+_logger = setup_logger("Utils")
 
 
 def log_execution_time(logger: logging.Logger):
@@ -54,18 +59,41 @@ def log_execution_time(logger: logging.Logger):
 
 
 def load_processed_registry(path) -> set:
-    """Загружает множество уже обработанных файлов."""
+    """
+    Загружает множество уже обработанных файлов.
+
+    Поддерживает оба формата:
+      - {"processed": ["a.ogg", ...]}  (текущий)
+      - ["a.ogg", ...]                 (старый, просто список)
+    При повреждённом файле возвращает пустое множество и пишет предупреждение.
+    """
+    path = Path(path)
     if not path.exists():
         return set()
     try:
         with open(path, 'r', encoding='utf-8') as f:
             data = json.load(f)
-            return set(data.get("processed", []))
-    except (json.JSONDecodeError, KeyError):
+    except (json.JSONDecodeError, OSError) as e:
+        _logger.warning(f"Не удалось прочитать реестр {path}: {e}. Начинаем с пустого.")
         return set()
+
+    if isinstance(data, list):
+        return {str(x) for x in data}
+    if isinstance(data, dict):
+        return {str(x) for x in data.get("processed", [])}
+
+    _logger.warning(f"Неизвестный формат реестра {path} ({type(data).__name__}). Начинаем с пустого.")
+    return set()
 
 
 def save_processed_registry(path, registry: set):
-    """Сохраняет реестр обработанных файлов."""
-    with open(path, 'w', encoding='utf-8') as f:
-        json.dump({"processed": list(registry)}, f, indent=2)
+    """
+    Сохраняет реестр обработанных файлов.
+    Запись атомарная (временный файл + replace), чтобы обрыв процесса
+    не оставил повреждённый JSON.
+    """
+    path = Path(path)
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    with open(tmp_path, 'w', encoding='utf-8') as f:
+        json.dump({"processed": sorted(registry)}, f, indent=2, ensure_ascii=False)
+    os.replace(tmp_path, path)
